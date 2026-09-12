@@ -122,16 +122,6 @@ the runtime path disabled, the module also provides the advanced option
 `hardware.tm3471-rmi.applyPatches`. Normal installations do not need it;
 `hardware.tm3471-rmi.enable = true` already applies the patches.
 
-## Files
-
-- `patches/0001-ACPI-resource-preserve-IRQ-7-flags-on-T14-Gen-2a.patch`
-- `patches/0002-TM3471-AMD-Host-Notify-and-Windows-F03-service.patch`
-- `nixos-module.nix`: opt-in NixOS integration, parameters, and load ordering
-- `flake.nix`: exports `nixosModules.default` and `nixosModules.tm3471-rmi`
-
-Experimental modules, captures, reverse-engineering notes, and the technical
-report intentionally live outside this distribution repository.
-
 ## License
 
 This repository is licensed under GPL-2.0-only. See `COPYING`.

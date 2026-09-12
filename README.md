@@ -38,14 +38,13 @@ two-finger geometry, which applications interpret as pinch-to-zoom.
 
 ## Add it to a NixOS flake
 
-After this repository is published, add it as a normal flake input. Replace
-`YOUR-GITHUB-NAME` with the repository owner:
+Add this repository as a normal flake input:
 
 ```nix
 {
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
-    tm3471-rmi.url = "github:YOUR-GITHUB-NAME/tm3471-linux-rmi";
+    tm3471-rmi.url = "github:SpencerMichaels/t14-amd-gen2-rmi";
   };
 
   outputs = inputs@{ nixpkgs, tm3471-rmi, ... }: {

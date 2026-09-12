@@ -1,0 +1,1245 @@
+diff --git a/drivers/i2c/busses/i2c-piix4.c b/drivers/i2c/busses/i2c-piix4.c
+index ac3bb550303fe5893822af50c385004c9292e695..ff5178b3f787430aeae9438fa7c3f92dd5f86966 100644
+--- a/drivers/i2c/busses/i2c-piix4.c
++++ b/drivers/i2c/busses/i2c-piix4.c
+@@ -34,6 +34,9 @@
+ #include <linux/dmi.h>
+ #include <linux/acpi.h>
+ #include <linux/io.h>
++#include <linux/interrupt.h>
++#include <linux/irq.h>
++#include <linux/jiffies.h>
+ #include <linux/platform_data/x86/amd-fch.h>
+ 
+ #include "i2c-piix4.h"
+@@ -89,6 +92,30 @@
+ #define SB800_PIIX4_FCH_PM_SIZE			8
+ #define SB800_ASF_ACPI_PATH			"\\_SB.ASFC"
+ 
++/* AMD ASF target registers, relative to the auxiliary SMBus base. */
++#define PIIX4_ASF_INDEX		0x07
++#define PIIX4_ASF_LISTEN_ADDR	0x09
++#define PIIX4_ASF_STATUS		0x0a
++#define PIIX4_ASF_SLAVE_STATUS	0x0d
++#define PIIX4_ASF_BANK_SEL	0x13
++#define PIIX4_ASF_SELECT_MASTER	BIT(7)
++#define PIIX4_ASF_SEMAPHORE	0x14
++#define PIIX4_ASF_SLAVE_EN	0x15
++#define PIIX4_ASF_IO_SIZE	0x20
++
++#define PIIX4_ASF_SLAVE_INTR	BIT(6)
++#define PIIX4_ASF_BANK0_FULL	BIT(2)
++#define PIIX4_ASF_BANK1_FULL	BIT(3)
++#define PIIX4_ASF_READ_BANK1	BIT(4)
++#define PIIX4_ASF_LAST_BANK1	BIT(0)
++#define PIIX4_ASF_SLAVE_INTR_EN	BIT(1)
++#define PIIX4_ASF_SLAVE_RESET	BIT(4)
++#define PIIX4_ASF_HOST_SEMAPHORE	BIT(0)
++#define PIIX4_ASF_CLEAR_HOST_SEMAPHORE	BIT(1)
++#define PIIX4_ASF_HOST_NOTIFY_LEN	4
++#define PIIX4_ASF_WINDOWS_MAX_FRAMES	2
++#define PIIX4_ASF_WINDOWS_POLICY_STORM_LIMIT	1000
++
+ /* insmod parameters */
+ 
+ /* If force is set to anything different from 0, we forcibly enable the
+@@ -105,6 +132,11 @@ MODULE_PARM_DESC(force_addr,
+ 		 "Forcibly enable the PIIX4 at the given address. "
+ 		 "EXTREMELY DANGEROUS!");
+ 
++static bool amd_host_notify;
++module_param(amd_host_notify, bool, 0444);
++MODULE_PARM_DESC(amd_host_notify,
++		 "Enable T14 Gen 2a AMD auxiliary-bus Host Notify support");
++
+ static int srvrworks_csb5_delay;
+ static struct pci_driver piix4_driver;
+ 
+@@ -155,6 +187,20 @@ struct i2c_piix4_adapdata {
+ 	bool notify_imc;
+ 	u8 port;		/* Port number, shifted */
+ 	struct sb800_mmio_cfg mmio_cfg;
++
++	/* Machine-specific AMD auxiliary Host Notify. */
++	bool host_notify;
++	bool host_notify_ready;
++	bool host_notify_stormed;
++	int irq;
++	unsigned long irq_window;
++	unsigned int irq_window_count;
++	spinlock_t asf_lock; /* Serializes target/FIFO register access. */
++	u8 staged_frame[PIIX4_ASF_WINDOWS_MAX_FRAMES]
++		       [PIIX4_ASF_HOST_NOTIFY_LEN];
++	u8 staged_count;
++	u32 pm_decode_saved;
++	u8 pm_control_saved;
+ };
+ 
+ int piix4_sb800_region_request(struct device *dev, struct sb800_mmio_cfg *mmio_cfg)
+@@ -518,15 +564,554 @@ static int piix4_setup_aux(struct pci_dev *PIIX4_dev,
+ 	return piix4_smba;
+ }
+ 
++static const struct dmi_system_id piix4_t14_gen2a_host_notify[] = {
++	{
++		.matches = {
++			DMI_MATCH(DMI_SYS_VENDOR, "LENOVO"),
++			DMI_MATCH(DMI_PRODUCT_NAME, "20XK001JUS"),
++			DMI_MATCH(DMI_PRODUCT_VERSION, "ThinkPad T14 Gen 2a"),
++		},
++	},
++	{ }
++};
++
++static int piix4_smb0001_irq(unsigned short smba)
++{
++	struct acpi_device *adev;
++	struct resource_entry *entry;
++	LIST_HEAD(resources);
++	bool found_io = false;
++	int irq = -ENODEV;
++	int ret;
++
++	adev = acpi_dev_get_first_match_dev("SMB0001", NULL, -1);
++	if (!adev)
++		return -ENODEV;
++
++	ret = acpi_dev_get_resources(adev, &resources, NULL, NULL);
++	if (ret < 0)
++		goto out_put;
++
++	resource_list_for_each_entry(entry, &resources) {
++		struct resource *res = entry->res;
++
++		if (resource_type(res) == IORESOURCE_IO &&
++		    res->start == smba && resource_size(res) >= PIIX4_ASF_IO_SIZE)
++			found_io = true;
++		else if (resource_type(res) == IORESOURCE_IRQ &&
++			 resource_size(res) == 1) {
++			unsigned long trigger_mask = IORESOURCE_IRQ_HIGHEDGE |
++				IORESOURCE_IRQ_LOWEDGE | IORESOURCE_IRQ_HIGHLEVEL |
++				IORESOURCE_IRQ_LOWLEVEL;
++
++			if ((res->flags & trigger_mask) != IORESOURCE_IRQ_LOWLEVEL ||
++			    !(res->flags & IORESOURCE_IRQ_SHAREABLE)) {
++				irq = -EINVAL;
++				break;
++			}
++			irq = res->start;
++		}
++	}
++
++	acpi_dev_free_resource_list(&resources);
++	if (!found_io)
++		irq = -ENODEV;
++out_put:
++	acpi_dev_put(adev);
++	return ret < 0 ? ret : irq;
++}
++
++static void piix4_asf_target_disable(struct i2c_piix4_adapdata *adapdata)
++{
++	unsigned short smba = adapdata->smba;
++	u8 val;
++
++	val = inb_p(smba + PIIX4_ASF_SLAVE_EN);
++	val &= ~PIIX4_ASF_SLAVE_INTR_EN;
++	val |= PIIX4_ASF_SLAVE_RESET;
++	outb_p(val, smba + PIIX4_ASF_SLAVE_EN);
++}
++
++static void piix4_asf_select_master(struct i2c_piix4_adapdata *adapdata)
++{
++	outb_p(PIIX4_ASF_SELECT_MASTER,
++	       adapdata->smba + PIIX4_ASF_BANK_SEL);
++}
++
++static void piix4_asf_irq_mask(struct i2c_piix4_adapdata *adapdata)
++{
++	unsigned short smba = adapdata->smba;
++	u8 val;
++
++	val = inb_p(smba + PIIX4_ASF_SLAVE_EN);
++	outb_p(val & ~PIIX4_ASF_SLAVE_INTR_EN,
++	       smba + PIIX4_ASF_SLAVE_EN);
++}
++
++static void piix4_asf_irq_unmask(struct i2c_piix4_adapdata *adapdata)
++{
++	unsigned short smba = adapdata->smba;
++	u8 val;
++
++	val = inb_p(smba + PIIX4_ASF_SLAVE_EN);
++	outb_p((val | PIIX4_ASF_SLAVE_INTR_EN) & ~PIIX4_ASF_SLAVE_RESET,
++	       smba + PIIX4_ASF_SLAVE_EN);
++}
++
++static void piix4_asf_windows_read_bank(
++		struct i2c_piix4_adapdata *adapdata, bool bank1,
++		u8 data[PIIX4_ASF_HOST_NOTIFY_LEN])
++{
++	unsigned short smba = adapdata->smba;
++	unsigned int i;
++
++	/* The installed Windows driver uses the literal selector table { 0, 0x10 }. */
++	outb_p(bank1 ? PIIX4_ASF_READ_BANK1 : 0,
++	       smba + PIIX4_ASF_BANK_SEL);
++	inb_p(smba + 0x02);
++	for (i = 0; i < PIIX4_ASF_HOST_NOTIFY_LEN; i++)
++		data[i] = inb_p(smba + PIIX4_ASF_INDEX);
++}
++
++/*
++ * Reproduce Smb_driver_AMDASF.sys 0x1400055e4/0x1400056fc.  Offset
++ * +0x13 is sampled exactly once.  Full banks are read oldest first and the
++ * saved full-bank bits are released in one combined write after all reads.
++ */
++static u8 piix4_asf_windows_read_banks(
++		struct i2c_piix4_adapdata *adapdata,
++		u8 frame[PIIX4_ASF_WINDOWS_MAX_FRAMES]
++			[PIIX4_ASF_HOST_NOTIFY_LEN])
++{
++	unsigned short smba = adapdata->smba;
++	u8 bank_sel = inb_p(smba + PIIX4_ASF_BANK_SEL);
++	u8 state = bank_sel & (PIIX4_ASF_BANK0_FULL |
++			       PIIX4_ASF_BANK1_FULL | PIIX4_ASF_LAST_BANK1);
++	u8 count = 0;
++
++	switch (state) {
++	case PIIX4_ASF_BANK0_FULL:
++		piix4_asf_windows_read_bank(adapdata, false, frame[count++]);
++		break;
++	case PIIX4_ASF_BANK1_FULL | PIIX4_ASF_LAST_BANK1:
++		piix4_asf_windows_read_bank(adapdata, true, frame[count++]);
++		break;
++	case PIIX4_ASF_BANK0_FULL | PIIX4_ASF_BANK1_FULL:
++		piix4_asf_windows_read_bank(adapdata, true, frame[count++]);
++		piix4_asf_windows_read_bank(adapdata, false, frame[count++]);
++		break;
++	case PIIX4_ASF_BANK0_FULL | PIIX4_ASF_BANK1_FULL |
++	     PIIX4_ASF_LAST_BANK1:
++		piix4_asf_windows_read_bank(adapdata, false, frame[count++]);
++		piix4_asf_windows_read_bank(adapdata, true, frame[count++]);
++		break;
++	case 0:
++	case PIIX4_ASF_LAST_BANK1:
++		return 0;
++	default:
++		/* Windows releases impossible nonempty states without parsing. */
++		outb_p(bank_sel & (PIIX4_ASF_BANK0_FULL |
++				     PIIX4_ASF_BANK1_FULL),
++		       smba + PIIX4_ASF_BANK_SEL);
++		return 0;
++	}
++
++	outb_p(bank_sel & (PIIX4_ASF_BANK0_FULL | PIIX4_ASF_BANK1_FULL),
++	       smba + PIIX4_ASF_BANK_SEL);
++	return count;
++}
++
++static void piix4_asf_windows_recover_target(
++		struct i2c_piix4_adapdata *adapdata)
++{
++	unsigned short smba = adapdata->smba;
++	u8 val = inb_p(smba + PIIX4_ASF_SLAVE_EN);
++
++	/* Exact 0x80 recovery ordering from Smb_driver_AMDASF.sys. */
++	outb_p(val | PIIX4_ASF_SLAVE_RESET, smba + PIIX4_ASF_SLAVE_EN);
++	outb_p(val & ~PIIX4_ASF_SLAVE_RESET, smba + PIIX4_ASF_SLAVE_EN);
++	outb_p(0x11, smba + PIIX4_ASF_LISTEN_ADDR);
++}
++
++/*
++ * Reproduce the reset/listen transition used by the Windows driver's
++ * SelfManagedIoInit path.
++ */
++static void piix4_asf_windows_restart_target(
++		struct i2c_piix4_adapdata *adapdata)
++{
++	unsigned short smba = adapdata->smba;
++	u8 val = inb_p(smba + PIIX4_ASF_SLAVE_EN);
++
++	/*
++	 * Runtime disable clears SLAVE_INTR_EN, whereas Windows arrives here with
++	 * it set by PrepareHardware.  Fold its restoration into the same two
++	 * writes so both cold start and runtime restart retain the recovered
++	 * reset-pulse -> listen-0x11 ordering.
++	 */
++	val |= PIIX4_ASF_SLAVE_INTR_EN;
++	outb_p(val | PIIX4_ASF_SLAVE_RESET, smba + PIIX4_ASF_SLAVE_EN);
++	outb_p(val & ~PIIX4_ASF_SLAVE_RESET, smba + PIIX4_ASF_SLAVE_EN);
++	outb_p(0x11, smba + PIIX4_ASF_LISTEN_ADDR);
++}
++
++/*
++ * Exact PrepareHardware target stage recovered from Smb_driver_AMDASF.sys:
++ * clear only the full banks from one saved +0x13 snapshot, save +0x15, select
++ * listen state 0x10, and perform the saved-value 0x12/0x02 enable sequence.
++ * The Linux IRQ remains disabled while this runs.  Its caller enables the IRQ
++ * and then immediately invokes the SelfManagedIoInit-equivalent restart helper.
++ */
++static void piix4_asf_windows_prepare_target(
++		struct i2c_piix4_adapdata *adapdata)
++{
++	unsigned short smba = adapdata->smba;
++	u8 bank_sel, old;
++
++	bank_sel = inb_p(smba + PIIX4_ASF_BANK_SEL);
++	outb_p(bank_sel & (PIIX4_ASF_BANK0_FULL | PIIX4_ASF_BANK1_FULL),
++	       smba + PIIX4_ASF_BANK_SEL);
++	old = inb_p(smba + PIIX4_ASF_SLAVE_EN);
++	outb_p(0x10, smba + PIIX4_ASF_LISTEN_ADDR);
++
++	outb_p(old | PIIX4_ASF_SLAVE_RESET | PIIX4_ASF_SLAVE_INTR_EN,
++	       smba + PIIX4_ASF_SLAVE_EN);
++	outb_p((old & ~PIIX4_ASF_SLAVE_RESET) | PIIX4_ASF_SLAVE_INTR_EN,
++	       smba + PIIX4_ASF_SLAVE_EN);
++}
++
++static int piix4_asf_acquire_host_semaphore(struct i2c_adapter *adap)
++{
++	struct i2c_piix4_adapdata *adapdata = i2c_get_adapdata(adap);
++	unsigned short smba = adapdata->smba;
++	int timeout = 0;
++	u8 value;
++
++	outb_p(PIIX4_ASF_HOST_SEMAPHORE, smba + PIIX4_ASF_SEMAPHORE);
++	while (++timeout < MAX_TIMEOUT) {
++		value = inb_p(smba + PIIX4_ASF_SEMAPHORE);
++		if (value & PIIX4_ASF_HOST_SEMAPHORE)
++			return 0;
++		usleep_range(250, 500);
++	}
++
++	/* Cancel a timed-out host request before returning to the caller. */
++	outb_p(PIIX4_ASF_CLEAR_HOST_SEMAPHORE,
++	       smba + PIIX4_ASF_SEMAPHORE);
++	dev_err_ratelimited(&adap->dev,
++			    "could not acquire ASF host semaphore\n");
++	return -EBUSY;
++}
++
++static void piix4_asf_release_host_semaphore(struct i2c_piix4_adapdata *adapdata)
++{
++	outb_p(PIIX4_ASF_CLEAR_HOST_SEMAPHORE,
++	       adapdata->smba + PIIX4_ASF_SEMAPHORE);
++}
++
++static bool piix4_asf_storm(struct i2c_adapter *adap)
++{
++	struct i2c_piix4_adapdata *adapdata = i2c_get_adapdata(adap);
++	unsigned long now = jiffies;
++
++	if (time_after(now, adapdata->irq_window + HZ)) {
++		adapdata->irq_window = now;
++		adapdata->irq_window_count = 0;
++	}
++
++	if (++adapdata->irq_window_count <=
++	    PIIX4_ASF_WINDOWS_POLICY_STORM_LIMIT)
++		return false;
++
++	adapdata->host_notify_stormed = true;
++	WRITE_ONCE(adapdata->host_notify_ready, false);
++	piix4_asf_target_disable(adapdata);
++	dev_err(&adap->dev,
++		"Host Notify disabled after interrupt storm (%u IRQs/window); receiver remains disabled until explicitly re-armed\n",
++		adapdata->irq_window_count);
++	return true;
++}
++
++static irqreturn_t piix4_asf_irq(int irq, void *data)
++{
++	struct i2c_adapter *adap = data;
++	struct i2c_piix4_adapdata *adapdata = i2c_get_adapdata(adap);
++	unsigned short smba = adapdata->smba;
++	u8 asf_status, count;
++	irqreturn_t ret;
++
++	spin_lock(&adapdata->asf_lock);
++		/*
++		 * Windows gives recovery bit 0x80 priority and performs no FIFO
++		 * work in that invocation.  A shared IRQ is ours only for 0x80 or
++		 * the literal SlaveIntr bit 0x40; bank fullness alone is not enough.
++		 * Do not W1C host +0x00 here: ENABLE_INT9 is zero and Linux's polled
++		 * master transaction path owns that completion status.
++		 */
++		asf_status = inb_p(smba + PIIX4_ASF_STATUS);
++		if (asf_status & BIT(7)) {
++			if (!piix4_asf_storm(adap))
++				piix4_asf_windows_recover_target(adapdata);
++			ret = IRQ_HANDLED;
++			goto out_unlock;
++		}
++		if (!(asf_status & PIIX4_ASF_SLAVE_INTR)) {
++			ret = IRQ_NONE;
++			goto out_unlock;
++		}
++
++		outb_p(PIIX4_ASF_SLAVE_INTR, smba + PIIX4_ASF_STATUS);
++		if (piix4_asf_storm(adap)) {
++			ret = IRQ_HANDLED;
++			goto out_unlock;
++		}
++
++		/* Windows acknowledges SlaveIntr, then rejects target-reset state. */
++		if (inb_p(smba + PIIX4_ASF_SLAVE_EN) &
++		    PIIX4_ASF_SLAVE_RESET) {
++			ret = IRQ_HANDLED;
++			goto out_unlock;
++		}
++
++		/* IRQF_ONESHOT must keep this handoff single-producer/single-consumer. */
++		if (WARN_ON_ONCE(adapdata->staged_count)) {
++			WRITE_ONCE(adapdata->host_notify_ready, false);
++			adapdata->host_notify_stormed = true;
++			piix4_asf_target_disable(adapdata);
++			ret = IRQ_HANDLED;
++			goto out_unlock;
++		}
++
++		count = piix4_asf_windows_read_banks(
++			adapdata, adapdata->staged_frame);
++		if (!count) {
++			ret = IRQ_HANDLED;
++			goto out_unlock;
++		}
++		/* Publish only after both hardware reads and the combined release. */
++		adapdata->staged_count = count;
++		ret = IRQ_WAKE_THREAD;
++		goto out_unlock;
++out_unlock:
++	spin_unlock(&adapdata->asf_lock);
++	return ret;
++}
++
++static void piix4_asf_process_frame(struct i2c_adapter *adap,
++				    const u8 data[PIIX4_ASF_HOST_NOTIFY_LEN])
++{
++	struct i2c_piix4_adapdata *adapdata = i2c_get_adapdata(adap);
++
++	if (data[0] == 0x10 && !(data[1] & 1) &&
++	    (data[1] >> 1) == 0x2c &&
++	    READ_ONCE(adapdata->host_notify_ready))
++		i2c_handle_smbus_host_notify(adap, data[1] >> 1);
++}
++
++static irqreturn_t piix4_asf_irq_thread(int irq, void *data)
++{
++	struct i2c_adapter *adap = data;
++	struct i2c_piix4_adapdata *adapdata = i2c_get_adapdata(adap);
++	unsigned long flags;
++	u8 frame[PIIX4_ASF_WINDOWS_MAX_FRAMES]
++		[PIIX4_ASF_HOST_NOTIFY_LEN];
++	u8 count, i;
++
++	/* IRQF_ONESHOT keeps the hardware source masked through this copy. */
++	spin_lock_irqsave(&adapdata->asf_lock, flags);
++	count = adapdata->staged_count;
++	if (WARN_ON_ONCE(count > PIIX4_ASF_WINDOWS_MAX_FRAMES))
++		count = 0;
++	memcpy(frame, adapdata->staged_frame, sizeof(frame));
++	adapdata->staged_count = 0;
++	spin_unlock_irqrestore(&adapdata->asf_lock, flags);
++
++	for (i = 0; i < count; i++)
++		piix4_asf_process_frame(adap, frame[i]);
++	return IRQ_HANDLED;
++}
++
++static int piix4_asf_pm_enable(struct device *dev,
++			       struct i2c_piix4_adapdata *adapdata)
++{
++	struct sb800_mmio_cfg *cfg = &adapdata->mmio_cfg;
++	u32 decode;
++	u8 control, disabled_control;
++	int ret;
++
++	ret = piix4_sb800_region_request(dev, cfg);
++	if (ret)
++		return ret;
++
++	/* Initialization sequence observed in Smb_driver_AMDASF.sys. */
++	decode = ioread32(cfg->addr + 0x00);
++	control = ioread8(cfg->addr + 0x02);
++	adapdata->pm_decode_saved = decode;
++	adapdata->pm_control_saved = control;
++	disabled_control = control & ~0x05;
++	iowrite32(decode | BIT(4), cfg->addr + 0x00);
++	iowrite8(disabled_control, cfg->addr + 0x02);
++	if (ioread8(cfg->addr + 0x02) != disabled_control) {
++		iowrite8(control, cfg->addr + 0x02);
++		iowrite32(decode, cfg->addr + 0x00);
++		piix4_sb800_region_release(dev, cfg);
++		dev_err(dev, "ASF setup transition failed; original state restored\n");
++		return -EIO;
++	}
++	piix4_sb800_region_release(dev, cfg);
++	return 0;
++}
++
++static int piix4_asf_pm_enable_transfer(struct i2c_adapter *adap,
++					 struct i2c_piix4_adapdata *adapdata)
++{
++	u8 control, semaphore;
++
++	if (!adapdata->host_notify)
++		return 0;
++	semaphore = inb_p(adapdata->smba + PIIX4_ASF_SEMAPHORE);
++	if (!(semaphore & PIIX4_ASF_HOST_SEMAPHORE)) {
++		dev_err(&adap->dev,
++			"refusing setup-byte RMW without verified ASF host semaphore ownership (semaphore=%02x)\n",
++			semaphore);
++		return -EACCES;
++	}
++
++	control = ioread8(adapdata->mmio_cfg.addr + 0x02);
++	iowrite8(control | 0x05, adapdata->mmio_cfg.addr + 0x02);
++	return 0;
++}
++
++/*
++ * Windows brackets its normal 07 -> 06 transition between the master-status
++ * completion acknowledgment (vendor RVA 547C) and the following ASF-status
++ * read (RVA 54DD), only 5.5--10.6 us later in synchronized captures.  Run the
++ * Clear at the equivalent Linux boundary, before response extraction or
++ * any target-status handling, rather than after the complete SMBus access has
++ * unwound to piix4_access_host_notify().
++ */
++static void piix4_asf_pm_ack_complete(
++		struct i2c_adapter *adap,
++		struct i2c_piix4_adapdata *adapdata)
++{
++	u8 control;
++
++	if (!adapdata->host_notify)
++		return;
++	control = ioread8(adapdata->mmio_cfg.addr + 0x02);
++	if (control & BIT(0))
++		iowrite8(control & ~BIT(0), adapdata->mmio_cfg.addr + 0x02);
++	control = ioread8(adapdata->mmio_cfg.addr + 0x02);
++	if (control & BIT(0))
++		dev_err_ratelimited(&adap->dev,
++				    "failed to clear ASF PM completion bit\n");
++}
++
++static void piix4_asf_pm_disable(struct device *dev,
++				 struct i2c_piix4_adapdata *adapdata)
++{
++	struct sb800_mmio_cfg *cfg = &adapdata->mmio_cfg;
++
++	if (!piix4_sb800_region_request(dev, cfg)) {
++		iowrite8(adapdata->pm_control_saved, cfg->addr + 0x02);
++		iowrite32(adapdata->pm_decode_saved, cfg->addr + 0x00);
++		piix4_sb800_region_release(dev, cfg);
++	}
++}
++
++static int piix4_asf_prepare(struct pci_dev *pdev, struct i2c_adapter *adap,
++			     struct i2c_piix4_adapdata *adapdata, int irq)
++{
++	unsigned long flags;
++	int ret;
++
++	if (irq != 7) {
++		dev_err(&pdev->dev,
++			"Host Notify is restricted to the recovered IRQ 7 topology (got IRQ %d)\n",
++			irq);
++		return -EINVAL;
++	}
++
++	if (!request_region(adapdata->smba + SMBIOSIZE,
++			    PIIX4_ASF_IO_SIZE - SMBIOSIZE,
++			    "piix4_smbus_host_notify"))
++		return -EBUSY;
++	adapdata->irq = irq;
++	adapdata->irq_window = jiffies;
++	spin_lock_init(&adapdata->asf_lock);
++
++	ret = piix4_asf_pm_enable(&pdev->dev, adapdata);
++	if (ret)
++		goto err_region;
++
++	ret = devm_request_threaded_irq(&pdev->dev, irq, piix4_asf_irq,
++					piix4_asf_irq_thread,
++					IRQF_ONESHOT | IRQF_TRIGGER_LOW |
++					IRQF_NO_AUTOEN,
++					"piix4_smbus_host_notify", adap);
++	if (ret)
++		goto err_pm;
++
++	spin_lock_irqsave(&adapdata->asf_lock, flags);
++	piix4_asf_windows_prepare_target(adapdata);
++	enable_irq(irq);
++	piix4_asf_windows_restart_target(adapdata);
++	spin_unlock_irqrestore(&adapdata->asf_lock, flags);
++
++	adapdata->host_notify = true;
++	return 0;
++
++err_pm:
++	piix4_asf_pm_disable(&pdev->dev, adapdata);
++err_region:
++	release_region(adapdata->smba + SMBIOSIZE,
++		       PIIX4_ASF_IO_SIZE - SMBIOSIZE);
++	return ret;
++}
++
++static void piix4_asf_quiesce(struct i2c_adapter *adap)
++{
++	struct i2c_piix4_adapdata *adapdata = i2c_get_adapdata(adap);
++	unsigned long flags;
++
++	if (!adapdata->host_notify)
++		return;
++
++	WRITE_ONCE(adapdata->host_notify_ready, false);
++	spin_lock_irqsave(&adapdata->asf_lock, flags);
++	piix4_asf_irq_mask(adapdata);
++	spin_unlock_irqrestore(&adapdata->asf_lock, flags);
++	disable_irq(adapdata->irq);
++	spin_lock_irqsave(&adapdata->asf_lock, flags);
++	piix4_asf_target_disable(adapdata);
++	spin_unlock_irqrestore(&adapdata->asf_lock, flags);
++}
++
++static void piix4_asf_finish(struct device *dev,
++			     struct i2c_adapter *adap,
++			     struct i2c_piix4_adapdata *adapdata)
++{
++	if (adapdata->host_notify) {
++		devm_free_irq(dev, adapdata->irq, adap);
++		adapdata->host_notify = false;
++		piix4_asf_pm_disable(dev, adapdata);
++		release_region(adapdata->smba + SMBIOSIZE,
++			       PIIX4_ASF_IO_SIZE - SMBIOSIZE);
++	}
++}
++
+ int piix4_transaction(struct i2c_adapter *piix4_adapter, unsigned short piix4_smba)
+ {
++	struct i2c_piix4_adapdata *adapdata =
++		i2c_get_adapdata(piix4_adapter);
+ 	int temp;
+ 	int result = 0;
+ 	int timeout = 0;
+ 
+-	dev_dbg(&piix4_adapter->dev, "Transaction (pre): CNT=%02x, CMD=%02x, "
+-		"ADD=%02x, DAT0=%02x, DAT1=%02x\n", inb_p(SMBHSTCNT),
+-		inb_p(SMBHSTCMD), inb_p(SMBHSTADD), inb_p(SMBHSTDAT0),
++	dev_dbg(&piix4_adapter->dev,
++		"Transaction (pre): CNT=%02x, CMD=%02x, ADD=%02x, DAT0=%02x, DAT1=%02x\n",
++		inb_p(SMBHSTCNT), inb_p(SMBHSTCMD),
++		inb_p(SMBHSTADD), inb_p(SMBHSTDAT0),
+ 		inb_p(SMBHSTDAT1));
+ 
+ 	/* Make sure the SMBus host is ready to start transmitting */
+@@ -534,7 +1119,8 @@ int piix4_transaction(struct i2c_adapter *piix4_adapter, unsigned short piix4_sm
+ 		dev_dbg(&piix4_adapter->dev, "SMBus busy (%02x). "
+ 			"Resetting...\n", temp);
+ 		outb_p(temp, SMBHSTSTS);
+-		if ((temp = inb_p(SMBHSTSTS)) != 0x00) {
++		temp = inb_p(SMBHSTSTS);
++		if (temp) {
+ 			dev_err(&piix4_adapter->dev, "Failed! (%02x)\n", temp);
+ 			return -EBUSY;
+ 		} else {
+@@ -555,6 +1141,11 @@ int piix4_transaction(struct i2c_adapter *piix4_adapter, unsigned short piix4_sm
+ 	       ((temp = inb_p(SMBHSTSTS)) & 0x01))
+ 		usleep_range(250, 500);
+ 
++	/* Windows selects the master side again before consuming its result. */
++	if (timeout != MAX_TIMEOUT && (temp & 0x1e) == 0x02 &&
++	    adapdata->host_notify)
++		piix4_asf_select_master(adapdata);
++
+ 	/* If the SMBus is still busy, we give up */
+ 	if (timeout == MAX_TIMEOUT) {
+ 		dev_err(&piix4_adapter->dev, "SMBus Timeout!\n");
+@@ -581,13 +1172,17 @@ int piix4_transaction(struct i2c_adapter *piix4_adapter, unsigned short piix4_sm
+ 	if (inb_p(SMBHSTSTS) != 0x00)
+ 		outb_p(inb(SMBHSTSTS), SMBHSTSTS);
+ 
++	/* Match Windows: clear PMIO immediately after completion W1C. */
++	piix4_asf_pm_ack_complete(piix4_adapter, adapdata);
++
+ 	if ((temp = inb_p(SMBHSTSTS)) != 0x00) {
+ 		dev_err(&piix4_adapter->dev, "Failed reset at end of "
+ 			"transaction (%02x)\n", temp);
+ 	}
+-	dev_dbg(&piix4_adapter->dev, "Transaction (post): CNT=%02x, CMD=%02x, "
+-		"ADD=%02x, DAT0=%02x, DAT1=%02x\n", inb_p(SMBHSTCNT),
+-		inb_p(SMBHSTCMD), inb_p(SMBHSTADD), inb_p(SMBHSTDAT0),
++	dev_dbg(&piix4_adapter->dev,
++		"Transaction (post): CNT=%02x, CMD=%02x, ADD=%02x, DAT0=%02x, DAT1=%02x\n",
++		inb_p(SMBHSTCNT), inb_p(SMBHSTCMD),
++		inb_p(SMBHSTADD), inb_p(SMBHSTDAT0),
+ 		inb_p(SMBHSTDAT1));
+ 	return result;
+ }
+@@ -603,6 +1198,13 @@ static s32 piix4_access(struct i2c_adapter * adap, u16 addr,
+ 	int i, len;
+ 	int status;
+ 
++	/*
++	 * Windows performs the first setup-byte RMW after taking +0x14 and
++	 * immediately before programming selector/address/command/data.
++	 */
++	status = piix4_asf_pm_enable_transfer(adap, adapdata);
++	if (status)
++		return status;
+ 	switch (size) {
+ 	case I2C_SMBUS_QUICK:
+ 		outb_p((addr << 1) | read_write,
+@@ -654,14 +1256,18 @@ static s32 piix4_access(struct i2c_adapter * adap, u16 addr,
+ 		return -EOPNOTSUPP;
+ 	}
+ 
++	/* Windows repeats the same idempotent RMW immediately before control. */
++	status = piix4_asf_pm_enable_transfer(adap, adapdata);
++	if (status)
++		return status;
+ 	outb_p((size & 0x1C) + (ENABLE_INT9 & 1), SMBHSTCNT);
+ 
+ 	status = piix4_transaction(adap, piix4_smba);
+ 	if (status)
+-		return status;
++		goto out_complete;
+ 
+ 	if ((read_write == I2C_SMBUS_WRITE) || (size == PIIX4_QUICK))
+-		return 0;
++		goto out_complete;
+ 
+ 
+ 	switch (size) {
+@@ -674,14 +1280,65 @@ static s32 piix4_access(struct i2c_adapter * adap, u16 addr,
+ 		break;
+ 	case PIIX4_BLOCK_DATA:
+ 		data->block[0] = inb_p(SMBHSTDAT0);
+-		if (data->block[0] == 0 || data->block[0] > I2C_SMBUS_BLOCK_MAX)
+-			return -EPROTO;
++		if (data->block[0] == 0 || data->block[0] > I2C_SMBUS_BLOCK_MAX) {
++			status = -EPROTO;
++			goto out_complete;
++		}
+ 		inb_p(SMBHSTCNT);	/* Reset SMBBLKDAT */
+ 		for (i = 1; i <= data->block[0]; i++)
+ 			data->block[i] = inb_p(SMBBLKDAT);
+ 		break;
+ 	}
+-	return 0;
++out_complete:
++	return status;
++}
++
++static s32 piix4_access_host_notify(struct i2c_adapter *adap, u16 addr,
++				    unsigned short flags, char read_write,
++				    u8 command, int size,
++				    union i2c_smbus_data *data)
++{
++	struct i2c_piix4_adapdata *adapdata = i2c_get_adapdata(adap);
++	unsigned long irqflags;
++	s32 ret;
++
++	ret = piix4_asf_acquire_host_semaphore(adap);
++	if (ret)
++		return ret;
++	/* Map the shared PM region before IRQ synchronization can block. */
++	ret = piix4_sb800_region_request(&adap->dev, &adapdata->mmio_cfg);
++	if (ret) {
++		piix4_asf_release_host_semaphore(adapdata);
++		return ret;
++	}
++
++	/*
++	 * The master engine and Host Notify FIFO share registers.  Stop the
++	 * level-triggered source before disable_irq() waits for the threaded
++	 * handler.  Reversing this order can livelock when the touchpad keeps
++	 * the source asserted with empty notifications.
++	 */
++	spin_lock_irqsave(&adapdata->asf_lock, irqflags);
++	piix4_asf_irq_mask(adapdata);
++	spin_unlock_irqrestore(&adapdata->asf_lock, irqflags);
++	disable_irq(adapdata->irq);
++	piix4_asf_select_master(adapdata);
++
++	ret = piix4_access(adap, addr, flags, read_write, command, size, data);
++
++	spin_lock_irqsave(&adapdata->asf_lock, irqflags);
++	if (ret && ret != -EIO && ret != -ENXIO) {
++		WRITE_ONCE(adapdata->host_notify_ready, false);
++		adapdata->host_notify_stormed = true;
++		piix4_asf_target_disable(adapdata);
++	} else if (!adapdata->host_notify_stormed) {
++		piix4_asf_irq_unmask(adapdata);
++	}
++	spin_unlock_irqrestore(&adapdata->asf_lock, irqflags);
++	enable_irq(adapdata->irq);
++	piix4_sb800_region_release(&adap->dev, &adapdata->mmio_cfg);
++	piix4_asf_release_host_semaphore(adapdata);
++	return ret;
+ }
+ 
+ static uint8_t piix4_imc_read(uint8_t idx)
+@@ -870,11 +1527,21 @@ static u32 piix4_func(struct i2c_adapter *adapter)
+ 	    I2C_FUNC_SMBUS_BLOCK_DATA;
+ }
+ 
++static u32 piix4_func_host_notify(struct i2c_adapter *adapter)
++{
++	return piix4_func(adapter) | I2C_FUNC_SMBUS_HOST_NOTIFY;
++}
++
+ static const struct i2c_algorithm smbus_algorithm = {
+ 	.smbus_xfer	= piix4_access,
+ 	.functionality	= piix4_func,
+ };
+ 
++static const struct i2c_algorithm piix4_smbus_algorithm_host_notify = {
++	.smbus_xfer	= piix4_access_host_notify,
++	.functionality	= piix4_func_host_notify,
++};
++
+ static const struct i2c_algorithm piix4_smbus_algorithm_sb800 = {
+ 	.smbus_xfer	= piix4_access_sb800,
+ 	.functionality	= piix4_func,
+@@ -912,6 +1579,7 @@ static int piix4_adapter_count;
+ 
+ static int piix4_add_adapter(struct pci_dev *dev, unsigned short smba,
+ 			     bool sb800_main, u8 port, bool notify_imc,
++			     bool host_notify, int irq,
+ 			     u8 hw_port_nr, const char *name,
+ 			     struct i2c_adapter **padap)
+ {
+@@ -927,8 +1595,9 @@ static int piix4_add_adapter(struct pci_dev *dev, unsigned short smba,
+ 
+ 	adap->owner = THIS_MODULE;
+ 	adap->class = I2C_CLASS_HWMON;
+-	adap->algo = sb800_main ? &piix4_smbus_algorithm_sb800
+-				: &smbus_algorithm;
++	adap->algo = host_notify ? &piix4_smbus_algorithm_host_notify :
++		     sb800_main ? &piix4_smbus_algorithm_sb800 :
++				  &smbus_algorithm;
+ 
+ 	adapdata = kzalloc(sizeof(*adapdata), GFP_KERNEL);
+ 	if (adapdata == NULL) {
+@@ -942,10 +1611,16 @@ static int piix4_add_adapter(struct pci_dev *dev, unsigned short smba,
+ 	adapdata->sb800_main = sb800_main;
+ 	adapdata->port = port << piix4_port_shift_sb800;
+ 	adapdata->notify_imc = notify_imc;
+-
+-	/* set up the sysfs linkage to our parent device */
++	adapdata->irq = -1;
++	i2c_set_adapdata(adap, adapdata);
+ 	adap->dev.parent = &dev->dev;
+ 
++	if (host_notify) {
++		retval = piix4_asf_prepare(dev, adap, adapdata, irq);
++		if (retval)
++			goto err_free;
++	}
++
+ 	if (has_acpi_companion(&dev->dev)) {
+ 		acpi_preset_companion(&adap->dev,
+ 				      ACPI_COMPANION(&dev->dev),
+@@ -955,14 +1630,19 @@ static int piix4_add_adapter(struct pci_dev *dev, unsigned short smba,
+ 	snprintf(adap->name, sizeof(adap->name),
+ 		"SMBus PIIX4 adapter%s at %04x", name, smba);
+ 
+-	i2c_set_adapdata(adap, adapdata);
+-
+ 	retval = i2c_add_adapter(adap);
+ 	if (retval) {
+-		kfree(adapdata);
+-		kfree(adap);
+-		release_region(smba, SMBIOSIZE);
+-		return retval;
++		goto err_host_notify;
++	}
++
++	if (host_notify) {
++		unsigned long flags;
++
++		spin_lock_irqsave(&adapdata->asf_lock, flags);
++		/* Do not resurrect a cold receiver which fused before adapter setup. */
++		WRITE_ONCE(adapdata->host_notify_ready,
++			   !adapdata->host_notify_stormed);
++		spin_unlock_irqrestore(&adapdata->asf_lock, flags);
+ 	}
+ 
+ 	/*
+@@ -975,6 +1655,18 @@ static int piix4_add_adapter(struct pci_dev *dev, unsigned short smba,
+ 
+ 	*padap = adap;
+ 	return 0;
++
++err_host_notify:
++	/* Stop and synchronize the live IRQ before freeing its adapter cookie. */
++	if (adapdata->host_notify) {
++		piix4_asf_quiesce(adap);
++		piix4_asf_finish(&dev->dev, adap, adapdata);
++	}
++err_free:
++	kfree(adapdata);
++	kfree(adap);
++	release_region(smba, SMBIOSIZE);
++	return retval;
+ }
+ 
+ static int piix4_add_adapters_sb800(struct pci_dev *dev, unsigned short smba,
+@@ -996,6 +1688,7 @@ static int piix4_add_adapters_sb800(struct pci_dev *dev, unsigned short smba,
+ 		u8 hw_port_nr = port == 0 ? 0 : port + 1;
+ 
+ 		retval = piix4_add_adapter(dev, smba, true, port, notify_imc,
++					   false, -1,
+ 					   hw_port_nr,
+ 					   piix4_main_port_names_sb800[port],
+ 					   &piix4_main_adapters[port]);
+@@ -1070,7 +1763,8 @@ static int piix4_probe(struct pci_dev *dev, const struct pci_device_id *id)
+ 			return retval;
+ 
+ 		/* Try to register main SMBus adapter, give up if we can't */
+-		retval = piix4_add_adapter(dev, retval, false, 0, false, 0,
++		retval = piix4_add_adapter(dev, retval, false, 0, false,
++					   false, -1, 0,
+ 					   "", &piix4_main_adapters[0]);
+ 		if (retval < 0)
+ 			return retval;
+@@ -1105,7 +1799,27 @@ static int piix4_probe(struct pci_dev *dev, const struct pci_device_id *id)
+ 	if (retval > 0) {
+ 		/* Try to add the aux adapter if it exists,
+ 		 * piix4_add_adapter will clean up if this fails */
+-		piix4_add_adapter(dev, retval, false, 0, false, 1,
++		int host_notify_irq = -ENODEV;
++		bool enable_host_notify = false;
++
++		if (amd_host_notify &&
++		    dev->vendor == PCI_VENDOR_ID_AMD &&
++		    dev->device == PCI_DEVICE_ID_AMD_KERNCZ_SMBUS &&
++		    dev->revision == 0x51 &&
++		    dev->subsystem_vendor == PCI_VENDOR_ID_LENOVO &&
++		    dev->subsystem_device == 0x5094 &&
++		    dmi_check_system(piix4_t14_gen2a_host_notify)) {
++			host_notify_irq = piix4_smb0001_irq(retval);
++			if (host_notify_irq >= 0)
++				enable_host_notify = true;
++			else
++				dev_err(&dev->dev,
++					"SMB0001 resources do not match auxiliary bus: %d\n",
++					host_notify_irq);
++		}
++
++		piix4_add_adapter(dev, retval, false, 0, false,
++				  enable_host_notify, host_notify_irq, 1,
+ 				  is_sb800 ? piix4_aux_port_name_sb800 : "",
+ 				  &piix4_aux_adapter);
+ 	}
+@@ -1116,9 +1830,12 @@ static int piix4_probe(struct pci_dev *dev, const struct pci_device_id *id)
+ static void piix4_adap_remove(struct i2c_adapter *adap)
+ {
+ 	struct i2c_piix4_adapdata *adapdata = i2c_get_adapdata(adap);
++	struct device *parent = adap->dev.parent;
+ 
+ 	if (adapdata->smba) {
++		piix4_asf_quiesce(adap);
+ 		i2c_del_adapter(adap);
++		piix4_asf_finish(parent, adap, adapdata);
+ 		if (adapdata->port == (0 << piix4_port_shift_sb800))
+ 			release_region(adapdata->smba, SMBIOSIZE);
+ 		kfree(adapdata);
+@@ -1136,7 +1853,6 @@ static void piix4_remove(struct pci_dev *dev)
+ 			piix4_main_adapters[port] = NULL;
+ 		}
+ 	}
+-
+ 	if (piix4_aux_adapter) {
+ 		piix4_adap_remove(piix4_aux_adapter);
+ 		piix4_aux_adapter = NULL;
+diff --git a/drivers/input/rmi4/rmi_driver.c b/drivers/input/rmi4/rmi_driver.c
+index ccd9338a44dbef915c7b834b940e3416f641bd5c..82a5980aa12bd54f1a3b06feb570044a9ef1a6d8 100644
+--- a/drivers/input/rmi4/rmi_driver.c
++++ b/drivers/input/rmi4/rmi_driver.c
+@@ -254,6 +254,27 @@ struct rmi_function *rmi_find_function(struct rmi_device *rmi_dev, u8 number)
+ 	return NULL;
+ }
+ 
++bool rmi_is_tm3471_030_3942087(struct rmi_device *rmi_dev)
++{
++	struct rmi_function *f01;
++	struct rmi_function *f12;
++	struct rmi_function *f3a;
++
++	if (!rmi_dev || !dev_get_drvdata(&rmi_dev->dev))
++		return false;
++
++	f01 = rmi_find_function(rmi_dev, 0x01);
++	f12 = rmi_find_function(rmi_dev, 0x12);
++	f3a = rmi_find_function(rmi_dev, 0x3a);
++	return rmi_f01_is_tm3471_030_3942087(f01) && f12 && f3a &&
++		f12->fd.query_base_addr == 0x0053 &&
++		f12->fd.command_base_addr == 0x0000 &&
++		f12->fd.control_base_addr == 0x001d &&
++		f12->fd.data_base_addr == 0x000c &&
++		f12->num_of_irqs == 2 && f12->irq_pos == 3 &&
++		f3a->dev.driver && f3a->num_of_irqs == 1 && f3a->irq_pos == 6;
++}
++
+ static int suspend_one_function(struct rmi_function *fn)
+ {
+ 	struct rmi_function_handler *fh;
+diff --git a/drivers/input/rmi4/rmi_driver.h b/drivers/input/rmi4/rmi_driver.h
+index e84495caab1514f56b28a2144c32795b82039b1c..d365ea25c5f2f289fca779c895964ad5a8fd2a74 100644
+--- a/drivers/input/rmi4/rmi_driver.h
++++ b/drivers/input/rmi4/rmi_driver.h
+@@ -89,6 +89,7 @@ int rmi_register_physical_driver(void);
+ void rmi_unregister_physical_driver(void);
+ void rmi_free_function_list(struct rmi_device *rmi_dev);
+ struct rmi_function *rmi_find_function(struct rmi_device *rmi_dev, u8 number);
++bool rmi_is_tm3471_030_3942087(struct rmi_device *rmi_dev);
+ int rmi_enable_sensor(struct rmi_device *rmi_dev);
+ int rmi_scan_pdt(struct rmi_device *rmi_dev, void *ctx,
+ 		 int (*callback)(struct rmi_device *rmi_dev, void *ctx,
+@@ -101,6 +102,7 @@ int rmi_initial_reset(struct rmi_device *rmi_dev, void *ctx,
+ 		      const struct pdt_entry *pdt);
+ 
+ const char *rmi_f01_get_product_ID(struct rmi_function *fn);
++bool rmi_f01_is_tm3471_030_3942087(struct rmi_function *fn);
+ 
+ #ifdef CONFIG_RMI4_F03
+ int rmi_f03_overwrite_button(struct rmi_function *fn, unsigned int button,
+diff --git a/drivers/input/rmi4/rmi_f01.c b/drivers/input/rmi4/rmi_f01.c
+index 47be64284b25ede8103ada86d6b58fd3a26976bb..9961fd3d7393a27d0985a82c7d011f8d1d4f7dc2 100644
+--- a/drivers/input/rmi4/rmi_f01.c
++++ b/drivers/input/rmi4/rmi_f01.c
+@@ -260,6 +260,23 @@ const char *rmi_f01_get_product_ID(struct rmi_function *fn)
+ 	return f01->properties.product_id;
+ }
+ 
++bool rmi_f01_is_tm3471_030_3942087(struct rmi_function *fn)
++{
++	struct f01_data *f01;
++
++	if (!fn || !fn->dev.driver)
++		return false;
++
++	f01 = dev_get_drvdata(&fn->dev);
++	return f01 && f01->properties.manufacturer_id == 1 &&
++		!strcmp(f01->properties.product_id, "TM3471-030") &&
++		f01->properties.firmware_id == 3942087 &&
++		fn->fd.query_base_addr == 0x0031 &&
++		fn->fd.command_base_addr == 0x0028 &&
++		fn->fd.control_base_addr == 0x0014 &&
++		fn->fd.data_base_addr == 0x0006;
++}
++
+ static ssize_t rmi_driver_manufacturer_id_show(struct device *dev,
+ 					       struct device_attribute *dattr,
+ 					       char *buf)
+diff --git a/drivers/input/rmi4/rmi_f03.c b/drivers/input/rmi4/rmi_f03.c
+index e1157ff0f00af2a9be2bf9b539704e71d19c1328..8d32afb173c29fc5308eca0b295dcfc9a36d0892 100644
+--- a/drivers/input/rmi4/rmi_f03.c
++++ b/drivers/input/rmi4/rmi_f03.c
+@@ -5,6 +5,8 @@
+  */
+ 
+ #include <linux/kernel.h>
++#include <linux/completion.h>
++#include <linux/delay.h>
+ #include <linux/slab.h>
+ #include <linux/serio.h>
+ #include <linux/notifier.h>
+@@ -25,6 +27,12 @@
+ 
+ #define PSMOUSE_OOB_EXTRA_BTNS		0x01
+ 
++static bool rmi_f03_tm3471_windows_service;
++module_param_named(tm3471_windows_service,
++		   rmi_f03_tm3471_windows_service, bool, 0444);
++MODULE_PARM_DESC(tm3471_windows_service,
++		 "Replay the Windows TM3471 F03 F5/F4 setup before registering its serio port");
++
+ struct f03_data {
+ 	struct rmi_function *fn;
+ 
+@@ -35,8 +43,51 @@ struct f03_data {
+ 
+ 	u8 device_count;
+ 	u8 rx_queue_length;
++	struct completion windows_reply;
++	bool windows_awaiting_reply;
++	bool windows_setup_done;
++	bool windows_service_active;
+ };
+ 
++static int rmi_f03_tm3471_command(struct f03_data *f03, u8 command)
++{
++	struct rmi_function *fn = f03->fn;
++	int error;
++
++	reinit_completion(&f03->windows_reply);
++	WRITE_ONCE(f03->windows_awaiting_reply, true);
++	error = rmi_write(fn->rmi_dev, fn->fd.data_base_addr, command);
++	if (error) {
++		WRITE_ONCE(f03->windows_awaiting_reply, false);
++		return error;
++	}
++
++	if (!wait_for_completion_timeout(&f03->windows_reply,
++					 msecs_to_jiffies(100))) {
++		WRITE_ONCE(f03->windows_awaiting_reply, false);
++		return -ETIMEDOUT;
++	}
++	return 0;
++}
++
++static int rmi_f03_tm3471_write_mask(struct rmi_function *fn,
++				     const u8 mask[2])
++{
++	u8 readback[2];
++	int error;
++
++	error = rmi_write_block(fn->rmi_dev, 0x0015, mask, sizeof(readback));
++	if (error)
++		return error;
++	error = rmi_read_block(fn->rmi_dev, 0x0015, readback,
++			       sizeof(readback));
++	if (error)
++		return error;
++	if (memcmp(mask, readback, sizeof(readback)))
++		return -EIO;
++	return 0;
++}
++
+ int rmi_f03_overwrite_button(struct rmi_function *fn, unsigned int button,
+ 			     int value)
+ {
+@@ -206,6 +257,7 @@ static int rmi_f03_probe(struct rmi_function *fn)
+ 		return -ENOMEM;
+ 
+ 	f03->fn = fn;
++	init_completion(&f03->windows_reply);
+ 
+ 	error = rmi_f03_initialize(f03);
+ 	if (error < 0)
+@@ -224,6 +276,41 @@ static int rmi_f03_config(struct rmi_function *fn)
+ 	struct f03_data *f03 = dev_get_drvdata(&fn->dev);
+ 	int error;
+ 
++	if (rmi_f03_tm3471_windows_service &&
++	    rmi_is_tm3471_030_3942087(fn->rmi_dev)) {
++		static const u8 temporary_mask[2] = { 0x80, 0x00 };
++		static const u8 final_mask[2] = { 0xdf, 0x00 };
++
++		f03->windows_service_active = true;
++		error = fn->rmi_dev->driver->set_irq_bits(fn->rmi_dev,
++							 fn->irq_mask);
++		if (error)
++			return error;
++		if (!f03->windows_setup_done) {
++			error = rmi_f03_tm3471_write_mask(fn, temporary_mask);
++			if (error)
++				return error;
++			error = rmi_f03_tm3471_command(f03, 0xf5);
++			if (error)
++				return error;
++			error = rmi_f03_tm3471_command(f03, 0xf4);
++			if (error)
++				return error;
++			error = rmi_f03_tm3471_write_mask(fn, final_mask);
++			if (error)
++				return error;
++			f03->windows_setup_done = true;
++		}
++
++		if (!f03->serio_registered) {
++			error = rmi_f03_register_pt(f03);
++			if (error)
++				return error;
++			f03->serio_registered = true;
++		}
++		return 0;
++	}
++
+ 	if (!f03->serio_registered) {
+ 		error = rmi_f03_register_pt(f03);
+ 		if (error)
+@@ -241,6 +328,39 @@ static int rmi_f03_config(struct rmi_function *fn)
+ 	return 0;
+ }
+ 
++static int rmi_f03_suspend(struct rmi_function *fn)
++{
++	struct f03_data *f03 = dev_get_drvdata(&fn->dev);
++
++	if (f03->windows_service_active)
++		WRITE_ONCE(f03->windows_setup_done, false);
++
++	return 0;
++}
++
++static int rmi_f03_resume(struct rmi_function *fn)
++{
++	struct f03_data *f03 = dev_get_drvdata(&fn->dev);
++	int error;
++
++	if (f03->windows_service_active &&
++	    !READ_ONCE(f03->windows_setup_done)) {
++		error = rmi_f03_config(fn);
++		if (error)
++			return error;
++
++		/*
++		 * The early reset/config pass can reach F12 while the resumed
++		 * transport is not yet ready for the F03 command reply.  Once F03 has
++		 * completed its verified exchange, replay all cached function
++		 * configuration so F12 is restored in the same stable state.
++		 */
++		return fn->rmi_dev->driver->reset_handler(fn->rmi_dev);
++	}
++
++	return 0;
++}
++
+ static irqreturn_t rmi_f03_attention(int irq, void *ctx)
+ {
+ 	struct rmi_function *fn = ctx;
+@@ -274,11 +394,29 @@ static irqreturn_t rmi_f03_attention(int irq, void *ctx)
+ 			dev_err(&fn->dev,
+ 				"%s: Failed to read F03 output buffers: %d\n",
+ 				__func__, error);
+-			serio_interrupt(f03->serio, 0, SERIO_TIMEOUT);
++			if (f03->serio)
++				serio_interrupt(f03->serio, 0, SERIO_TIMEOUT);
+ 			return IRQ_RETVAL(error);
+ 		}
+ 	}
+ 
++	if (f03->windows_service_active &&
++	    (READ_ONCE(f03->windows_awaiting_reply) ||
++	     !f03->serio_registered)) {
++		if (READ_ONCE(f03->windows_awaiting_reply)) {
++			for (i = 0; i < ob_len; i += RMI_F03_OB_SIZE) {
++				if ((obs[i] & RMI_F03_RX_DATA_OFB) &&
++				    obs[i + RMI_F03_OB_DATA_OFFSET] == 0xfa) {
++					WRITE_ONCE(f03->windows_awaiting_reply,
++						   false);
++					complete(&f03->windows_reply);
++					break;
++				}
++			}
++		}
++		return IRQ_HANDLED;
++	}
++
+ 	for (i = 0; i < ob_len; i += RMI_F03_OB_SIZE) {
+ 		ob_status = obs[i];
+ 		ob_data = obs[i + RMI_F03_OB_DATA_OFFSET];
+@@ -320,6 +458,8 @@ struct rmi_function_handler rmi_f03_handler = {
+ 	.probe = rmi_f03_probe,
+ 	.config = rmi_f03_config,
+ 	.attention = rmi_f03_attention,
++	.suspend = rmi_f03_suspend,
++	.resume = rmi_f03_resume,
+ 	.remove = rmi_f03_remove,
+ };
+ 

@@ -1,0 +1,48 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Spencer Michaels <spencer@spencermichaels.net>
+Date: Tue, 8 Sep 2026 14:31:48 -0700
+Subject: [PATCH 1/4] ACPI: resource: preserve IRQ 7 flags on T14 Gen 2a
+
+
+diff --git a/drivers/acpi/resource.c b/drivers/acpi/resource.c
+index d16906f46..7185e2b2f 100644
+--- a/drivers/acpi/resource.c
++++ b/drivers/acpi/resource.c
+@@ -695,6 +695,26 @@ static const struct dmi_system_id irq1_edge_low_force_override[] = {
+ 	{ }
+ };
+ 
++/*
++ * The auxiliary SMBus controller on this machine is described by SMB0001
++ * with a legacy IRQ resource for IRQ 7 (level, active low, shared).  Its MADT
++ * has no matching source override, so the usual legacy-IRQ override turns it
++ * into an unusable edge-triggered interrupt.
++ *
++ * This is intentionally restricted to the machine used to develop the
++ * experimental AMD FCH Host Notify support.
++ */
++static const struct dmi_system_id irq7_level_low_skip_override[] = {
++	{
++		.matches = {
++			DMI_MATCH(DMI_SYS_VENDOR, "LENOVO"),
++			DMI_MATCH(DMI_PRODUCT_NAME, "20XK001JUS"),
++			DMI_MATCH(DMI_PRODUCT_VERSION, "ThinkPad T14 Gen 2a"),
++		},
++	},
++	{ }
++};
++
+ struct irq_override_cmp {
+ 	const struct dmi_system_id *system;
+ 	unsigned char irq;
+@@ -707,6 +727,7 @@ struct irq_override_cmp {
+ static const struct irq_override_cmp override_table[] = {
+ 	{ irq1_level_low_skip_override, 1, ACPI_LEVEL_SENSITIVE, ACPI_ACTIVE_LOW, 0, false },
+ 	{ irq1_edge_low_force_override, 1, ACPI_EDGE_SENSITIVE, ACPI_ACTIVE_LOW, 1, true },
++	{ irq7_level_low_skip_override, 7, ACPI_LEVEL_SENSITIVE, ACPI_ACTIVE_LOW, 1, false },
+ };
+ 
+ static bool acpi_dev_irq_override(u32 gsi, u8 triggering, u8 polarity,
+-- 
+2.55.0
+

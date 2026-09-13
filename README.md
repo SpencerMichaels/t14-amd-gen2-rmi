@@ -46,6 +46,9 @@ Owners of other potentially affected ThinkPads should follow the
 [safe testing guide](TESTING.md). Submit a read-only hardware inventory before
 trying the patch on an unmatched machine.
 
+For a technical overview, including the boundary between the maintained patch
+and a possible upstream design, see [ARCHITECTURE.md](ARCHITECTURE.md).
+
 ## How to help
 
 The most useful contributions are hardware inventories and results from

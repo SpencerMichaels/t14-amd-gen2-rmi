@@ -1,0 +1,205 @@
+name: Approved hardware test result
+description: Report results from an approved, identity-gated test build
+title: "Test result: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this form only after a maintainer has reviewed your hardware inventory and provided or approved a build with exact identity gates for your machine.
+
+        Do not remove or broaden those gates. This form is for input-driver testing, not firmware flashing. Remove serial numbers, UUIDs, MAC addresses, asset tags, and other private data from all output.
+
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Test prerequisites
+      options:
+        - label: A maintainer reviewed the hardware inventory before this test.
+          required: true
+        - label: I used the approved build without removing or broadening its identity checks.
+          required: true
+        - label: I kept a known-good boot entry and another usable input method available.
+          required: true
+        - label: I did not enter F34 flash mode or attempt a firmware update.
+          required: true
+        - label: I removed private identifiers from the information below.
+          required: true
+
+  - type: input
+    id: inventory
+    attributes:
+      label: Approved hardware-inventory issue
+      description: Link the inventory issue that was reviewed before testing.
+      placeholder: https://github.com/SpencerMichaels/t14-amd-gen2-rmi/issues/…
+    validations:
+      required: true
+
+  - type: input
+    id: model
+    attributes:
+      label: ThinkPad model and DMI product name
+      placeholder: Lenovo ThinkPad … — 20XXXXXXXX
+    validations:
+      required: true
+
+  - type: input
+    id: touchpad
+    attributes:
+      label: Touchpad product and firmware
+      placeholder: TM3471-030, firmware 3942087
+    validations:
+      required: true
+
+  - type: input
+    id: patch_commit
+    attributes:
+      label: Patch commit
+      description: Give the complete Git commit used for the test. Do not write only `main` or a branch name.
+      placeholder: 40-character Git commit
+    validations:
+      required: true
+
+  - type: input
+    id: kernel
+    attributes:
+      label: Kernel version
+      description: Output of `uname -r` from the tested boot.
+      placeholder: 6.x.y
+    validations:
+      required: true
+
+  - type: input
+    id: distribution
+    attributes:
+      label: Distribution and integration method
+      placeholder: NixOS 26.11 using the supplied flake module
+    validations:
+      required: true
+
+  - type: textarea
+    id: boot_identity
+    attributes:
+      label: Tested boot identity
+      description: Paste the tested system revision or build identifier and only the boot parameters relevant to RMI, psmouse, I2C, or SMBus.
+      render: shell
+    validations:
+      required: true
+
+  - type: dropdown
+    id: startup
+    attributes:
+      label: Cold-start result
+      description: A cold start means power was fully removed before boot. Choose Not tested if you performed only a normal reboot.
+      options:
+        - Pass
+        - Partial
+        - Fail
+        - Not tested
+    validations:
+      required: true
+
+  - type: textarea
+    id: initialization
+    attributes:
+      label: Initialization evidence
+      description: Record whether the RMI parent, F01, F03, F12, and F3A bound; include relevant kernel messages and any probe delay or error.
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: input_matrix
+    attributes:
+      label: Input test matrix
+      description: Replace each result with Pass, Partial, Fail, or Not tested, and add concise observations.
+      value: |
+        | Feature | Result | Notes |
+        | --- | --- | --- |
+        | One-finger touchpad motion |  |  |
+        | Mechanical clickpad press |  |  |
+        | Tap-to-click, if enabled |  |  |
+        | Two-finger scrolling |  |  |
+        | Pinch gesture |  |  |
+        | TrackPoint motion |  |  |
+        | Physical left button |  |  |
+        | Physical middle button |  |  |
+        | Physical right button |  |  |
+    validations:
+      required: true
+
+  - type: textarea
+    id: gesture_quality
+    attributes:
+      label: Scrolling and gesture quality
+      description: Describe ordinary two-finger scrolling, including any false pinch-to-zoom events, lost scrolls, jumps, or unexpected sensitivity.
+    validations:
+      required: true
+
+  - type: textarea
+    id: idle
+    attributes:
+      label: Idle result
+      description: State the untouched duration before and after input, whether controller interrupts reached zero, and any unexpected pointer movement or wakeups. Write Not tested if omitted.
+    validations:
+      required: true
+
+  - type: textarea
+    id: suspend
+    attributes:
+      label: Suspend and resume result
+      description: Give the number and approximate duration of cycles. State which input functions worked after every resume and include any RMI, F03, timeout, or interrupt-read messages. Write Not tested if omitted.
+    validations:
+      required: true
+
+  - type: textarea
+    id: failures
+    attributes:
+      label: Failures, warnings, or regressions
+      description: Report every unexpected result, even if it recovered. Include when it happened, whether it repeated, and how the system was recovered. Write None observed if applicable.
+    validations:
+      required: true
+
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Evidence
+      description: Link or attach redacted kernel logs, input summaries, interrupt counts, and test output. Avoid full system journals unless they have been reviewed for private data.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: overall
+    attributes:
+      label: Overall result
+      options:
+        - Pass
+        - Partial
+        - Fail
+    validations:
+      required: true
+
+  - type: dropdown
+    id: tested_by_permission
+    attributes:
+      label: Tested-by permission
+      description: A Tested-by tag may be included in a future kernel patch only with your explicit permission.
+      options:
+        - No — do not use a Tested-by tag
+        - Yes — use the identity supplied below
+    validations:
+      required: true
+
+  - type: input
+    id: tested_by_identity
+    attributes:
+      label: Tested-by identity, if permitted
+      description: If you selected Yes, provide the exact `Real Name <email@example.com>` text to use. Otherwise leave this empty.
+      placeholder: Real Name <email@example.com>
+
+  - type: checkboxes
+    id: accuracy
+    attributes:
+      label: Accuracy confirmation
+      options:
+        - label: This report distinguishes behavior I observed from behavior I did not test.
+          required: true

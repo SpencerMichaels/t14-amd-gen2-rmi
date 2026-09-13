@@ -1,0 +1,164 @@
+name: Hardware compatibility inventory
+description: Submit read-only hardware details for another potentially affected ThinkPad
+title: "Inventory: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this form before trying the patch on hardware that is not listed as tested.
+
+        This inventory is read-only. Do not remove the patch's identity checks, force it to load, scan arbitrary SMBus addresses, or write to device registers. Remove serial numbers, UUIDs, MAC addresses, asset tags, and other private data from all output.
+
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Safety confirmation
+      options:
+        - label: I have not removed or broadened the patch's hardware identity checks.
+          required: true
+        - label: I have removed serial numbers and other private identifiers from the information below.
+          required: true
+
+  - type: input
+    id: model
+    attributes:
+      label: ThinkPad model
+      description: Use the complete marketing name and generation, such as Lenovo ThinkPad T14 Gen 2 AMD.
+      placeholder: Lenovo ThinkPad …
+    validations:
+      required: true
+
+  - type: input
+    id: distribution
+    attributes:
+      label: Linux distribution
+      placeholder: NixOS 26.11, Arch Linux, Fedora 43, …
+    validations:
+      required: true
+
+  - type: input
+    id: kernel
+    attributes:
+      label: Kernel version
+      description: Output of `uname -r`.
+      placeholder: 6.x.y
+    validations:
+      required: true
+
+  - type: textarea
+    id: dmi
+    attributes:
+      label: DMI identity
+      description: Run the commands below and paste their output. These files normally contain model identifiers, not the machine serial number.
+      render: shell
+      value: |
+        $ cat /sys/class/dmi/id/sys_vendor
+
+        $ cat /sys/class/dmi/id/product_name
+
+        $ cat /sys/class/dmi/id/product_version
+
+        $ cat /sys/class/dmi/id/board_name
+    validations:
+      required: true
+
+  - type: textarea
+    id: controller
+    attributes:
+      label: AMD SMBus controller
+      description: Paste the PCI identity, revision, subsystem, and active driver. Adjust `00:14.0` only if `lspci` places the AMD FCH SMBus controller elsewhere.
+      render: shell
+      value: |
+        $ lspci -nn -s 00:14.0
+
+        $ lspci -nnk -s 00:14.0
+    validations:
+      required: true
+
+  - type: textarea
+    id: acpi
+    attributes:
+      label: ACPI and interrupt resources
+      description: Paste matching lines only. Do not include unrelated interrupt or device information.
+      render: shell
+      value: |
+        $ find /sys/bus/acpi/devices -maxdepth 1 -name 'SMB0001:*' -printf '%f\n'
+
+        $ grep -E '(^|[[:space:]])(7|12):|i2c|SMBus|smbus|rmi' /proc/interrupts
+    validations:
+      required: true
+
+  - type: textarea
+    id: smbus_adapters
+    attributes:
+      label: I2C/SMBus adapters
+      description: Run only `i2cdetect -l`, which lists adapters without probing device addresses. Do not run an address scan.
+      render: shell
+      value: |
+        $ i2cdetect -l
+    validations:
+      required: true
+
+  - type: textarea
+    id: touchpad_log
+    attributes:
+      label: Touchpad and RMI kernel messages
+      description: Paste the matching boot messages. Check again for private data before submitting.
+      render: shell
+      value: |
+        $ journalctl -b -k --no-pager | grep -Ei 'synaptics|touchpad|trackpoint|psmouse|rmi4|smbus|host notify'
+    validations:
+      required: true
+
+  - type: textarea
+    id: input_devices
+    attributes:
+      label: Input-device identity
+      description: Paste the touchpad and TrackPoint sections from `libinput list-devices`, including their kernel paths and capabilities.
+      placeholder: Paste the relevant libinput sections here.
+    validations:
+      required: true
+
+  - type: textarea
+    id: boot_parameters
+    attributes:
+      label: Relevant boot parameters
+      description: Paste only parameters related to psmouse, Synaptics, RMI, I2C, or SMBus. Write `none` if there are no relevant parameters.
+      render: shell
+      placeholder: psmouse.synaptics_intertouch=1
+    validations:
+      required: true
+
+  - type: dropdown
+    id: current_mode
+    attributes:
+      label: Current touchpad mode
+      options:
+        - PS/2 only
+        - Native RMI4
+        - HID
+        - Unknown
+    validations:
+      required: true
+
+  - type: textarea
+    id: symptoms
+    attributes:
+      label: Current behavior
+      description: Describe what works, what does not work, and whether `psmouse.synaptics_intertouch=1` changes anything.
+    validations:
+      required: true
+
+  - type: textarea
+    id: notes
+    attributes:
+      label: Additional context
+      description: Add relevant links, prior reports, or other read-only observations. Do not attach a full system log without checking it for private data.
+
+  - type: checkboxes
+    id: no_testing_request
+    attributes:
+      label: Scope confirmation
+      options:
+        - label: I understand that submitting an inventory is not approval to test this patch on unmatched hardware.
+          required: true

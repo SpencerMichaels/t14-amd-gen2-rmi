@@ -2,22 +2,45 @@
 
 This repository provides a small Linux kernel patch set and an opt-in NixOS
 module. Together, they enable the Synaptics TM3471 touchpad's native RMI4 over
-SMBus interface on one exact laptop model:
-
-- Lenovo ThinkPad T14 Gen 2 AMD
-- DMI product name `20XK001JUS`
-- DMI product version `ThinkPad T14 Gen 2a`
-- Synaptics product `TM3471-030`
-- Tested touchpad firmware `3942087`
-- Tested Linux version `6.18.48`
-
-The result supports touchpad motion, multitouch scrolling and gestures,
-clickpad input, the three physical buttons, and the TrackPoint. It has passed
-cold-boot, idle, suspend/resume, physical-input, and false-pinch tests on the
-development machine.
+SMBus interface on one exact laptop configuration.
 
 This is a machine-specific fix. It is not yet a generic or upstream-ready AMD
 Host Notify implementation.
+
+## Compatibility and test status
+
+Only the following hardware and software combination has been tested:
+
+| System | DMI identity | Touchpad | Firmware | Linux | Result |
+| --- | --- | --- | --- | --- | --- |
+| Lenovo ThinkPad T14 Gen 2 AMD | `20XK001JUS`, `ThinkPad T14 Gen 2a` | Synaptics `TM3471-030` | `3942087` | `6.18.48` on NixOS | Working |
+
+On that machine, the native RMI mode has passed positive tests for:
+
+- touchpad motion, multitouch scrolling, and gestures;
+- mechanical clickpad presses;
+- TrackPoint motion and its left, middle, and right buttons;
+- tap-to-click when enabled in libinput;
+- cold boot and suspend/resume;
+- quiet idle before and after physical input;
+- ordinary two-finger scrolling without false pinch gestures;
+- removal and reconstruction of the live RMI device; and
+- return to usable PS/2 mode when the patch's runtime path is deliberately
+  disabled.
+
+The following are not currently claimed:
+
+- support for any other ThinkPad model, machine type, touchpad, or firmware;
+- compatibility with Linux versions other than `6.18.48`;
+- hibernation;
+- completion of a long-term unattended reliability test;
+- firmware updates through F34 or `fwupd`;
+- optional F54/F55 diagnostic functions; or
+- installation methods other than the supplied NixOS module.
+
+The identity checks in the patches intentionally leave unmatched systems
+unchanged. Similar hardware must be inventoried and tested before its identity
+is added. Do not remove or broaden those checks merely to make the patch load.
 
 ## What the patch set changes
 

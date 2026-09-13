@@ -42,6 +42,10 @@ The identity checks in the patches intentionally leave unmatched systems
 unchanged. Similar hardware must be inventoried and tested before its identity
 is added. Do not remove or broaden those checks merely to make the patch load.
 
+Owners of other potentially affected ThinkPads should follow the
+[safe testing guide](TESTING.md). Submit a read-only hardware inventory before
+trying the patch on an unmatched machine.
+
 ## What the patch set changes
 
 The first patch preserves the firmware-provided level-low, shared IRQ 7

@@ -46,6 +46,20 @@ Owners of other potentially affected ThinkPads should follow the
 [safe testing guide](TESTING.md). Submit a read-only hardware inventory before
 trying the patch on an unmatched machine.
 
+## How to help
+
+The most useful contributions are hardware inventories and results from
+approved test builds. Use the repository's issue forms and attach concise,
+redacted evidence. Report partial results, warnings, and failures as well as
+successful tests.
+
+Please coordinate code changes before opening a pull request. Supporting
+another machine requires reviewed identity gates and cannot be inferred from a
+similar model name. Permission to use a kernel `Tested-by:` tag must be given
+explicitly in the test report; it is not inferred from an issue or GitHub
+username. Formal kernel sign-off instructions will be added if this work
+reaches upstream submission.
+
 ## What the patch set changes
 
 The first patch preserves the firmware-provided level-low, shared IRQ 7

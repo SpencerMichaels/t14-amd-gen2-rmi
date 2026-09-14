@@ -13,7 +13,7 @@ Only the following hardware and software combination has been tested:
 
 | System | DMI identity | Touchpad | Firmware | Linux | Result |
 | --- | --- | --- | --- | --- | --- |
-| Lenovo ThinkPad T14 Gen 2 AMD | `20XK001JUS`, `ThinkPad T14 Gen 2a` | Synaptics `TM3471-030` | `3942087` | `6.18.48` on NixOS | Working |
+| Lenovo ThinkPad T14 Gen 2 AMD | `20XK001JUS`, `ThinkPad T14 Gen 2a` | Synaptics `TM3471-030` | `3942087` | `6.18.48` on NixOS | Core input works; see reliability issue below |
 
 On that machine, the native RMI mode has passed positive tests for:
 
@@ -23,10 +23,18 @@ On that machine, the native RMI mode has passed positive tests for:
 - tap-to-click when enabled in libinput;
 - cold boot and suspend/resume;
 - quiet idle before and after physical input;
-- ordinary two-finger scrolling without false pinch gestures;
+- clean two-finger geometry immediately after a fresh boot;
 - removal and reconstruction of the live RMI device; and
 - return to usable PS/2 mode when the patch's runtime path is deliberately
   disabled.
+
+**Known reliability issue:** false pinch-to-zoom gestures can return after the
+system has been running. Raw input captures show that the F12 contact geometry
+can begin a two-finger gesture with about 6–8 mm of separation and then jump to
+about 17–20 mm within 60 ms. A full reboot cleared the condition in the tested
+case, but rebuilding only the live RMI device did not. The cause is still under
+investigation. Treat this release as experimental rather than a complete
+production solution.
 
 The following are not currently claimed:
 

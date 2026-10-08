@@ -18,9 +18,9 @@ behavior into code that may fit the Linux kernel more generally.
 | Proven system | Lenovo ThinkPad T14 Gen 2 AMD, machine type `20XK001JUS` |
 | Proven touchpad | Synaptics `TM3471-030`, firmware ID `3942087` |
 | Proven kernel | Linux `6.18.48` on NixOS |
-| Maintained delivery | Two kernel patches and an opt-in NixOS module |
+| Maintained delivery | Three kernel patches and an opt-in NixOS module |
 | Other machines | Not enabled; each one needs an inventory and a separately reviewed gate |
-| Reliability | Core input works, but false pinch geometry can return after uptime |
+| Reliability | Core input works; post-resume false pinch geometry is hidden by keeping the touchpad out of automatic doze |
 | Upstream status | Not submitted; the controller architecture needs maintainer discussion |
 
 The tested system provides touchpad motion, multi-finger scrolling and
@@ -162,12 +162,14 @@ can have different firmware, resource wiring, or controller behavior.
 ## Known limits and open technical questions
 
 - Only Linux 6.18.48 and the hardware listed above are proven.
-- False pinch-to-zoom gestures can return after the system has been running.
-  Raw captures show incorrect F12 geometry at the start of some two-finger
-  contacts even when all recorded SMBus reads succeed. Rebuilding the RMI
-  device does not clear the condition; a full reboot did. This localizes the
-  retained state below the reconstructed RMI function stack, but does not yet
-  distinguish the AMD controller, the touchpad, or the PS/2-to-RMI handoff.
+- False pinch-to-zoom gestures follow most resumes when automatic doze is
+  allowed. Raw captures show incorrect F12 geometry at the start of some
+  two-finger contacts even when all recorded SMBus reads succeed. Rebuilding
+  the RMI device and an F54 force calibration do not clear the condition; a
+  full reboot did. Setting F01 NoSleep while awake hides it immediately and
+  clearing it brings it back without a resume, so the retained state is
+  expressed only through automatic doze. The third patch keeps NoSleep set by
+  default; the state itself and a power-neutral fix remain open.
 - One experimental double-suspend run lost F12 touch input while TrackPoint and
   button input remained available. Later double-suspend testing passed. The
   evidence points to an intermittent F03 resume race, not to F34 itself.

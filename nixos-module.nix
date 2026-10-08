@@ -43,6 +43,11 @@ in
           patch = patchFile
             "0002-TM3471-AMD-Host-Notify-and-Windows-F03-service.patch";
         }
+        {
+          name = "t14-gen2a-tm3471-nosleep";
+          patch = patchFile
+            "0003-Input-rmi4-keep-T14-Gen-2a-TM3471-out-of-automatic-doze.patch";
+        }
       ];
     })
 
